@@ -2,7 +2,7 @@
 
 一个基于支付宝转账码的自动化支付解决方案，支持经营码收款和转账码收款两种模式。
 
-![image](https://i.111666.best/image/RtWU4WTcP2GIga8GBLBq1O.png)
+![1752570395623.png](https://youke1.picui.cn/s1/2025/07/15/68761a1507c8d.png)
 
 ## 特性
 
