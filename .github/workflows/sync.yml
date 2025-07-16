@@ -1,35 +1,105 @@
-name: Sync Main Branch
+name: Auto Sync Fork
 
 on:
-  push:
-    branches:
-      - main # 当main分支有新的push时触发
+  # 定时任务：每天北京时间上午9点执行
+  schedule:
+    - cron: '0 1 * * *'  # UTC时间1点 = 北京时间9点
+  
+  # 手动触发
+  workflow_dispatch:
+  
+  # 当upstream有新的push时触发（需要webhook配置）
+  repository_dispatch:
+    types: [upstream-sync]
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-
+    
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0 # 获取所有历史，以便进行rebase或merge
-
-    - name: Add upstream remote
-      run: git remote add upstream https://github.com/voici5986/AliMPay.git # 请替换为原始仓库的URL
-
-    - name: Fetch upstream
-      run: git fetch upstream
-
-    - name: Configure Git
-      run: |
-        git config user.name "GitHub Actions"
-        git config user.email "github-actions@github.com"
-
-    - name: Rebase onto upstream main
-      run: git rebase upstream/main || git merge upstream/main --no-edit # 尝试rebase，如果失败则尝试merge
-
-    - name: Push changes
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 自动提供的token
-      run: git push origin main --force # 强制推送以覆盖旧的提交历史，请谨慎使用
+      - name: Checkout fork repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0  # 获取完整历史记录
+      
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+      
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/ours1505/AliMPay.git
+          git remote -v
+      
+      - name: Fetch upstream changes
+        run: |
+          git fetch upstream
+          git fetch origin
+      
+      - name: Check for changes
+        id: check_changes
+        run: |
+          # 检查upstream的main分支是否有新的提交
+          UPSTREAM_COMMIT=$(git rev-parse upstream/main)
+          FORK_COMMIT=$(git rev-parse origin/main)
+          
+          echo "Upstream commit: $UPSTREAM_COMMIT"
+          echo "Fork commit: $FORK_COMMIT"
+          
+          if [ "$UPSTREAM_COMMIT" != "$FORK_COMMIT" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "upstream_commit=$UPSTREAM_COMMIT" >> $GITHUB_OUTPUT
+            echo "Changes detected, will proceed with sync"
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No changes detected, skipping sync"
+          fi
+      
+      - name: Sync main branch
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          # 切换到main分支
+          git checkout main
+          
+          # 合并upstream的main分支
+          git merge upstream/main --no-edit
+          
+          # 推送到fork仓库
+          git push origin main
+      
+      - name: Create sync summary
+        if: steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          echo "## 🔄 Fork Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upstream Repository**: https://github.com/ours1505/AliMPay" >> $GITHUB_STEP_SUMMARY
+          echo "- **Fork Repository**: https://github.com/voici5986/AliMPay" >> $GITHUB_STEP_SUMMARY
+          echo "- **Sync Status**: ✅ Success" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upstream Commit**: ${{ steps.check_changes.outputs.upstream_commit }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Sync Time**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+          
+          # 获取最新的提交信息
+          echo "### 📝 Latest Changes" >> $GITHUB_STEP_SUMMARY
+          git log --oneline -5 upstream/main >> $GITHUB_STEP_SUMMARY
+      
+      - name: No changes summary
+        if: steps.check_changes.outputs.has_changes == 'false'
+        run: |
+          echo "## 🔄 Fork Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upstream Repository**: https://github.com/ours1505/AliMPay" >> $GITHUB_STEP_SUMMARY
+          echo "- **Fork Repository**: https://github.com/voici5986/AliMPay" >> $GITHUB_STEP_SUMMARY
+          echo "- **Sync Status**: ℹ️ No changes detected" >> $GITHUB_STEP_SUMMARY
+          echo "- **Check Time**: $(date -u)" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Handle sync conflicts
+        if: failure() && steps.check_changes.outputs.has_changes == 'true'
+        run: |
+          echo "## ⚠️ Sync Failed" >> $GITHUB_STEP_SUMMARY
+          echo "The automatic sync failed, likely due to conflicts." >> $GITHUB_STEP_SUMMARY
+          echo "Please manually resolve conflicts:" >> $GITHUB_STEP_SUMMARY
+          echo "1. \`git remote add upstream https://github.com/ours1505/AliMPay.git\`" >> $GITHUB_STEP_SUMMARY
+          echo "2. \`git fetch upstream\`" >> $GITHUB_STEP_SUMMARY
+          echo "3. \`git checkout main\`" >> $GITHUB_STEP_SUMMARY
+          echo "4. \`git merge upstream/main\`" >> $GITHUB_STEP_SUMMARY
+          echo "5. Resolve conflicts and push" >> $GITHUB_STEP_SUMMARY
