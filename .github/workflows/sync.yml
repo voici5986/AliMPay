@@ -1,0 +1,35 @@
+name: Sync Main Branch
+
+on:
+  push:
+    branches:
+      - main # 当main分支有新的push时触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0 # 获取所有历史，以便进行rebase或merge
+
+    - name: Add upstream remote
+      run: git remote add upstream https://github.com/voici5986/AliMPay.git # 请替换为原始仓库的URL
+
+    - name: Fetch upstream
+      run: git fetch upstream
+
+    - name: Configure Git
+      run: |
+        git config user.name "GitHub Actions"
+        git config user.email "github-actions@github.com"
+
+    - name: Rebase onto upstream main
+      run: git rebase upstream/main || git merge upstream/main --no-edit # 尝试rebase，如果失败则尝试merge
+
+    - name: Push changes
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 自动提供的token
+      run: git push origin main --force # 强制推送以覆盖旧的提交历史，请谨慎使用
