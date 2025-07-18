@@ -43,7 +43,7 @@ class ImprovedLockManager {
         // 确保锁文件目录存在，使用更安全的权限
         $lockDir = dirname($lockFile);
         if (!is_dir($lockDir)) {
-            mkdir($lockDir, 0750, true); // 更严格的权限
+            mkdir($lockDir, 0750, true);
         }
     }
     
@@ -68,7 +68,7 @@ class ImprovedLockManager {
                 }
                 
                 // 设置文件权限
-                chmod($this->lockFile, 0640); // 更安全的权限
+                chmod($this->lockFile, 0640);
                 
                 // 使用文件锁（非阻塞）
                 if (flock($this->lockHandle, LOCK_EX | LOCK_NB)) {
@@ -80,7 +80,7 @@ class ImprovedLockManager {
                     $lockInfo = [
                         'timestamp' => time(),
                         'timeout' => $this->timeout,
-                        'server_id' => substr(md5(gethostname() . getmypid()), 0, 8) // 使用hash代替直接的PID
+                        'server_id' => substr(md5(gethostname() . getmypid()), 0, 8)
                     ];
                     
                     fwrite($this->lockHandle, json_encode($lockInfo));
@@ -224,9 +224,21 @@ function startMonitoringServiceIfNeeded() {
     static $checkInterval = 30; // 30秒内不重复检查
     
     $currentTime = time();
+    $logger = Logger::getInstance();
     
-    // 避免频繁检查，减少性能影响
-    if ($currentTime - $lastCheck < $checkInterval) {
+    // 记录调用信息
+    $logger->debug('startMonitoringServiceIfNeeded called', [
+        'current_time' => $currentTime,
+        'last_check' => $lastCheck,
+        'time_since_last_check' => $currentTime - $lastCheck
+    ]);
+    
+    // 检查是否是强制触发
+    $forceStart = isset($_GET['internal_trigger']) && $_GET['internal_trigger'] === 'force_start';
+    
+    // 避免频繁检查，减少性能影响（除非强制启动）
+    if (!$forceStart && $currentTime - $lastCheck < $checkInterval) {
+        $logger->debug('Skipping monitoring check due to interval limit');
         return;
     }
     
@@ -240,12 +252,14 @@ function startMonitoringServiceIfNeeded() {
     // 使用非阻塞锁，避免API请求被阻塞
     if (!$lockManager->tryLock()) {
         // 无法获取锁，说明监控服务已经在运行
-        Logger::getInstance()->debug('Monitoring service already running, skipping');
+        $logger->debug('Monitoring service already running, skipping');
+        
+        // 即使无法获取锁，也更新一个"尝试运行"的状态
+        updateMonitorStatus('attempted', 'Monitoring already running, lock not acquired');
         return;
     }
     
     try {
-        $logger = Logger::getInstance();
         $logger->info('Container monitoring service triggered by API request');
 
         // 增加配置文件存在性检查
@@ -266,11 +280,17 @@ function startMonitoringServiceIfNeeded() {
         $paymentMonitor->runMonitoringCycle();
         $logger->info('Container monitoring cycle completed successfully');
         
+        // 更新监控状态文件，供health.php检查
+        updateMonitorStatus('completed', 'API triggered monitoring cycle completed successfully');
+        
         // 在后台异步启动持续监控
         startBackgroundMonitoring();
         
     } catch (Exception $e) {
-        Logger::getInstance()->error('Container monitoring failed', ['error' => $e->getMessage()]);
+        $logger->error('Container monitoring failed', ['error' => $e->getMessage()]);
+        
+        // 更新监控状态文件记录错误
+        updateMonitorStatus('error', $e->getMessage());
     } finally {
         $lockManager->releaseLock();
     }
@@ -493,6 +513,85 @@ $logger->info("Container background monitor stopped", ["total_cycles" => $cycleC
     
     file_put_contents($scriptPath, $script);
     Logger::getInstance()->info('Container monitor script created', ['path' => $scriptPath]);
+}
+
+/**
+ * 更新监控状态文件
+ */
+function updateMonitorStatus($status, $message = '') {
+    try {
+        $statusFile = __DIR__ . '/data/monitor_status.json';
+        
+        // 确保目录存在
+        $statusDir = dirname($statusFile);
+        if (!is_dir($statusDir)) {
+            if (!mkdir($statusDir, 0750, true)) {
+                throw new Exception("Failed to create status directory: $statusDir");
+            }
+        }
+        
+        // 检查目录权限
+        if (!is_writable($statusDir)) {
+            throw new Exception("Status directory is not writable: $statusDir");
+        }
+        
+        $statusData = [
+            'last_run' => time(),
+            'last_run_formatted' => date('Y-m-d H:i:s'),
+            'status' => $status,
+            'message' => $message,
+            'updated_by' => 'api_request',
+            'php_version' => PHP_VERSION,
+            'memory_usage' => memory_get_usage(true)
+        ];
+        
+        if ($status === 'completed') {
+            $statusData['last_success'] = time();
+            $statusData['last_success_formatted'] = date('Y-m-d H:i:s');
+        } elseif ($status === 'error') {
+            $statusData['last_error'] = $message;
+            $statusData['last_error_time'] = time();
+        }
+        
+        $jsonData = json_encode($statusData, JSON_PRETTY_PRINT);
+        if ($jsonData === false) {
+            throw new Exception('Failed to encode status data to JSON');
+        }
+        
+        $result = file_put_contents($statusFile, $jsonData, LOCK_EX);
+        if ($result === false) {
+            throw new Exception("Failed to write status file: $statusFile");
+        }
+        
+        // 设置文件权限
+        chmod($statusFile, 0640);
+        
+        Logger::getInstance()->info('Monitor status updated successfully', [
+            'file' => $statusFile,
+            'status' => $status,
+            'bytes_written' => $result
+        ]);
+        
+    } catch (Exception $e) {
+        Logger::getInstance()->error('Failed to update monitor status', [
+            'error' => $e->getMessage(),
+            'status_file' => $statusFile ?? 'unknown',
+            'attempted_status' => $status
+        ]);
+        
+        // 尝试创建一个简单的状态文件
+        try {
+            $fallbackFile = __DIR__ . '/monitor_status_fallback.txt';
+            $fallbackData = date('Y-m-d H:i:s') . " - Status: $status - Message: $message\n";
+            file_put_contents($fallbackFile, $fallbackData, FILE_APPEND | LOCK_EX);
+        } catch (Exception $fe) {
+            // 最后的备选方案失败，记录到日志
+            Logger::getInstance()->critical('All status update methods failed', [
+                'original_error' => $e->getMessage(),
+                'fallback_error' => $fe->getMessage()
+            ]);
+        }
+    }
 }
 
 function redirectToSubmitPage(array $paymentResult) {
