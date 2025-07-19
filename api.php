@@ -23,91 +23,342 @@ use AliMPay\Core\BackgroundTaskManager;
 use AliMPay\Core\PaymentMonitor;
 
 /**
- * 容器友好的监控服务启动器
- * 在每次API请求时检查并启动监控服务
+ * 改进的锁管理器 - 生产环境安全版本
  */
-function startMonitoringServiceIfNeeded() {
-    $lockFile = __DIR__ . '/data/monitor.lock';
-    $monitorInterval = 300; // 5分钟锁定时间
+class ImprovedLockManager {
+    private $lockFile;
+    private $lockHandle;
+    private $timeout;
+    private $logger;
+    private $maxRetries = 3;
+    private static $lockCheckCache = [];
+    private static $lastCacheTime = 0;
+    private static $cacheTimeout = 5; // 5秒缓存
     
-    try {
-        // 检查是否需要启动监控服务
-        $shouldStart = false;
+    public function __construct($lockFile, $timeout = 300) {
+        $this->lockFile = $lockFile;
+        $this->timeout = $timeout;
+        $this->logger = Logger::getInstance();
         
-        if (!file_exists($lockFile)) {
-            $shouldStart = true;
-        } else {
-            $lastRun = filemtime($lockFile);
-            $timeSinceLastRun = time() - $lastRun;
-            
-            // 如果超过300秒（5分钟）没有运行，认为服务可能已停止
-            if ($timeSinceLastRun > 300) {
-                $shouldStart = true;
-            }
+        // 确保锁文件目录存在，使用更安全的权限
+        $lockDir = dirname($lockFile);
+        if (!is_dir($lockDir)) {
+            mkdir($lockDir, 0750, true);
         }
+    }
+    
+    /**
+     * 尝试获取锁（非阻塞）- 增强安全版本
+     */
+    public function tryLock() {
+        $retries = 0;
         
-        if ($shouldStart) {
-            $taskManager = new BackgroundTaskManager($lockFile, $monitorInterval);
-            
-            if ($taskManager->acquireLock()) {
-                try {
-                    $logger = Logger::getInstance();
-                    $logger->info('Container monitoring service triggered by API request');
-
-                    $alipayConfig = require __DIR__ . '/config/alipay.php';
-                    $billQuery = new \AliMPay\Core\BillQuery(new \AliMPay\Core\AlipayClient($alipayConfig));
-                    $logger->info('Alipay client for container monitoring initialized');
+        while ($retries < $this->maxRetries) {
+            try {
+                // 检查是否有过期的锁
+                $this->cleanupExpiredLock();
+                
+                // 尝试创建锁文件，使用更安全的模式
+                $this->lockHandle = fopen($this->lockFile, 'c+');
+                
+                if (!$this->lockHandle) {
+                    $retries++;
+                    usleep(100000); // 等待100ms后重试
+                    continue;
+                }
+                
+                // 设置文件权限
+                chmod($this->lockFile, 0640);
+                
+                // 使用文件锁（非阻塞）
+                if (flock($this->lockHandle, LOCK_EX | LOCK_NB)) {
+                    // 清空文件内容
+                    ftruncate($this->lockHandle, 0);
+                    rewind($this->lockHandle);
                     
-                    $codePay = new CodePay();
-                    $db = $codePay->getDb();
-                    $merchantConfig = $codePay->getMerchantInfo();
-
-                    $paymentMonitor = new PaymentMonitor($billQuery, $db, $merchantConfig);
-                    $paymentMonitor->runMonitoringCycle();
-                    $logger->info('Container monitoring cycle completed successfully');
+                    // 写入锁信息（不包含敏感的PID信息）
+                    $lockInfo = [
+                        'timestamp' => time(),
+                        'timeout' => $this->timeout,
+                        'server_id' => substr(md5(gethostname() . getmypid()), 0, 8)
+                    ];
                     
-                    // 在后台异步启动持续监控
-                    startBackgroundMonitoring();
+                    fwrite($this->lockHandle, json_encode($lockInfo));
+                    fflush($this->lockHandle);
                     
-                } catch (Exception $e) {
-                    Logger::getInstance()->error('Container monitoring failed', ['error' => $e->getMessage()]);
-                } finally {
-                    $taskManager->releaseLock();
+                    $this->logger->info('Lock acquired successfully', [
+                        'file' => basename($this->lockFile),
+                        'server_id' => $lockInfo['server_id']
+                    ]);
+                    return true;
+                } else {
+                    fclose($this->lockHandle);
+                    $this->lockHandle = null;
+                    return false;
+                }
+                
+            } catch (Exception $e) {
+                $this->logger->error('Failed to acquire lock', [
+                    'error' => $e->getMessage(),
+                    'retry' => $retries + 1
+                ]);
+                $this->cleanup();
+                $retries++;
+                
+                if ($retries < $this->maxRetries) {
+                    usleep(200000); // 等待200ms后重试
                 }
             }
         }
-    } catch (Exception $e) {
-        Logger::getInstance()->error('Error in container monitoring startup', ['error' => $e->getMessage()]);
+        
+        return false;
+    }
+    
+    /**
+     * 释放锁 - 增强安全版本
+     */
+    public function releaseLock() {
+        try {
+            if ($this->lockHandle && is_resource($this->lockHandle)) {
+                flock($this->lockHandle, LOCK_UN);
+                fclose($this->lockHandle);
+                $this->lockHandle = null;
+            }
+            
+            if (file_exists($this->lockFile)) {
+                unlink($this->lockFile);
+            }
+            
+            $this->logger->debug('Lock released successfully', ['file' => basename($this->lockFile)]);
+            
+        } catch (Exception $e) {
+            $this->logger->error('Failed to release lock', ['error' => $e->getMessage()]);
+        }
+    }
+    
+    /**
+     * 清理过期的锁 - 增强版本
+     */
+    private function cleanupExpiredLock() {
+        if (!file_exists($this->lockFile)) {
+            return;
+        }
+        
+        try {
+            // 使用缓存避免频繁的文件操作
+            $cacheKey = $this->lockFile;
+            $currentTime = time();
+            
+            if (isset(self::$lockCheckCache[$cacheKey]) && 
+                ($currentTime - self::$lastCacheTime) < self::$cacheTimeout) {
+                return;
+            }
+            
+            $lockContent = @file_get_contents($this->lockFile);
+            if ($lockContent === false) {
+                return;
+            }
+            
+            $lockInfo = @json_decode($lockContent, true);
+            
+            if (!$lockInfo || !isset($lockInfo['timestamp'], $lockInfo['timeout'])) {
+                // 无效的锁文件，直接删除
+                @unlink($this->lockFile);
+                $this->logger->info('Removed invalid lock file', ['file' => basename($this->lockFile)]);
+                return;
+            }
+            
+            $lockAge = $currentTime - $lockInfo['timestamp'];
+            
+            // 检查锁是否过期
+            if ($lockAge > $lockInfo['timeout']) {
+                // 尝试获取文件锁来确保安全删除
+                $testHandle = @fopen($this->lockFile, 'r+');
+                if ($testHandle) {
+                    if (flock($testHandle, LOCK_EX | LOCK_NB)) {
+                        flock($testHandle, LOCK_UN);
+                        fclose($testHandle);
+                        @unlink($this->lockFile);
+                        $this->logger->info('Removed expired lock file', [
+                            'file' => basename($this->lockFile),
+                            'age' => $lockAge
+                        ]);
+                    } else {
+                        fclose($testHandle);
+                    }
+                }
+            }
+            
+            // 更新缓存
+            self::$lockCheckCache[$cacheKey] = $currentTime;
+            self::$lastCacheTime = $currentTime;
+            
+        } catch (Exception $e) {
+            $this->logger->error('Failed to cleanup expired lock', ['error' => $e->getMessage()]);
+        }
+    }
+    
+    /**
+     * 清理资源
+     */
+    private function cleanup() {
+        if ($this->lockHandle && is_resource($this->lockHandle)) {
+            @fclose($this->lockHandle);
+            $this->lockHandle = null;
+        }
+    }
+    
+    /**
+     * 析构函数，确保锁被释放
+     */
+    public function __destruct() {
+        $this->releaseLock();
     }
 }
 
 /**
- * 启动后台持续监控（异步）
+ * 改进的监控服务启动器 - 生产环境优化版本
+ */
+function startMonitoringServiceIfNeeded() {
+    static $lastCheck = 0;
+    static $checkInterval = 30; // 30秒内不重复检查
+    
+    $currentTime = time();
+    $logger = Logger::getInstance();
+    
+    // 记录调用信息
+    $logger->debug('startMonitoringServiceIfNeeded called', [
+        'current_time' => $currentTime,
+        'last_check' => $lastCheck,
+        'time_since_last_check' => $currentTime - $lastCheck
+    ]);
+    
+    // 检查是否是强制触发
+    $forceStart = isset($_GET['internal_trigger']) && $_GET['internal_trigger'] === 'force_start';
+    
+    // 避免频繁检查，减少性能影响（除非强制启动）
+    if (!$forceStart && $currentTime - $lastCheck < $checkInterval) {
+        $logger->debug('Skipping monitoring check due to interval limit');
+        return;
+    }
+    
+    $lastCheck = $currentTime;
+    
+    $lockFile = __DIR__ . '/data/monitor.lock';
+    $monitorInterval = 300; // 5分钟锁定时间
+    
+    $lockManager = new ImprovedLockManager($lockFile, $monitorInterval);
+    
+    // 使用非阻塞锁，避免API请求被阻塞
+    if (!$lockManager->tryLock()) {
+        // 无法获取锁，说明监控服务已经在运行
+        $logger->debug('Monitoring service already running, skipping');
+        
+        // 即使无法获取锁，也更新一个"尝试运行"的状态
+        updateMonitorStatus('attempted', 'Monitoring already running, lock not acquired');
+        return;
+    }
+    
+    try {
+        $logger->info('Container monitoring service triggered by API request');
+
+        // 增加配置文件存在性检查
+        $configFile = __DIR__ . '/config/alipay.php';
+        if (!file_exists($configFile)) {
+            throw new Exception('Alipay configuration file not found');
+        }
+        
+        $alipayConfig = require $configFile;
+        $billQuery = new \AliMPay\Core\BillQuery(new \AliMPay\Core\AlipayClient($alipayConfig));
+        $logger->info('Alipay client for container monitoring initialized');
+        
+        $codePay = new CodePay();
+        $db = $codePay->getDb();
+        $merchantConfig = $codePay->getMerchantInfo();
+
+        $paymentMonitor = new PaymentMonitor($billQuery, $db, $merchantConfig);
+        $paymentMonitor->runMonitoringCycle();
+        $logger->info('Container monitoring cycle completed successfully');
+        
+        // 更新监控状态文件，供health.php检查
+        updateMonitorStatus('completed', 'API triggered monitoring cycle completed successfully');
+        
+        // 在后台异步启动持续监控
+        startBackgroundMonitoring();
+        
+    } catch (Exception $e) {
+        $logger->error('Container monitoring failed', ['error' => $e->getMessage()]);
+        
+        // 更新监控状态文件记录错误
+        updateMonitorStatus('error', $e->getMessage());
+    } finally {
+        $lockManager->releaseLock();
+    }
+}
+
+/**
+ * 改进的后台监控启动 - 生产环境安全版本
  */
 function startBackgroundMonitoring() {
     $backgroundScript = __DIR__ . '/container_monitor.php';
+    $lockFile = __DIR__ . '/data/container_monitor.lock';
+    
+    // 检查后台监控是否已经在运行
+    $backgroundLock = new ImprovedLockManager($lockFile, 3600); // 1小时超时
+    
+    if (!$backgroundLock->tryLock()) {
+        Logger::getInstance()->debug('Background monitoring already running');
+        return;
+    }
+    
+    // 立即释放锁，让后台脚本自己管理
+    $backgroundLock->releaseLock();
     
     // 检查后台监控脚本是否存在
     if (!file_exists($backgroundScript)) {
         createBackgroundMonitorScript($backgroundScript);
     }
     
-    // 在后台启动监控脚本
-    if (PHP_OS_FAMILY !== 'Windows') {
-        // Linux/Unix 环境
-        $command = "nohup php {$backgroundScript} > /dev/null 2>&1 &";
-    } else {
-        // Windows 环境
-        $command = "start /B php {$backgroundScript}";
+    // 验证脚本文件完整性
+    if (filesize($backgroundScript) < 1000) { // 基本的文件大小检查
+        Logger::getInstance()->warning('Background script seems incomplete, recreating');
+        createBackgroundMonitorScript($backgroundScript);
     }
     
-    exec($command);
-    
-    Logger::getInstance()->info('Background monitoring process started', ['script' => $backgroundScript]);
+    try {
+        // 在后台启动监控脚本，增加错误处理
+        if (PHP_OS_FAMILY !== 'Windows') {
+            // Linux/Unix 环境 - 使用更安全的方式
+            $command = sprintf(
+                'nohup %s %s > /dev/null 2>&1 & echo $!',
+                escapeshellarg(PHP_BINARY),
+                escapeshellarg($backgroundScript)
+            );
+        } else {
+            // Windows 环境
+            $command = sprintf(
+                'start /B %s %s',
+                escapeshellarg(PHP_BINARY),
+                escapeshellarg($backgroundScript)
+            );
+        }
+        
+        $pid = exec($command);
+        
+        Logger::getInstance()->info('Background monitoring process started', [
+            'script' => basename($backgroundScript),
+            'pid' => $pid
+        ]);
+        
+    } catch (Exception $e) {
+        Logger::getInstance()->error('Failed to start background monitoring', [
+            'error' => $e->getMessage()
+        ]);
+    }
 }
 
 /**
- * 创建容器专用的后台监控脚本
+ * 创建改进的后台监控脚本
  */
 function createBackgroundMonitorScript($scriptPath) {
     $script = '<?php
@@ -129,14 +380,87 @@ $lockFile = __DIR__ . \'/data/container_monitor.lock\';
 $monitorInterval = 30; // 30秒间隔
 $maxRunTime = 3600; // 最多运行1小时后自动退出，让API重新启动
 
-// 创建锁文件
-file_put_contents($lockFile, getmypid());
+// 使用改进的锁管理器
+class ImprovedLockManager {
+    private $lockFile;
+    private $lockHandle;
+    private $timeout;
+    private $logger;
+    
+    public function __construct($lockFile, $timeout = 300) {
+        $this->lockFile = $lockFile;
+        $this->timeout = $timeout;
+        $this->logger = Logger::getInstance();
+        
+        $lockDir = dirname($lockFile);
+        if (!is_dir($lockDir)) {
+            mkdir($lockDir, 0755, true);
+        }
+    }
+    
+    public function tryLock() {
+        try {
+            $this->lockHandle = fopen($this->lockFile, \'w\');
+            
+            if (!$this->lockHandle) {
+                return false;
+            }
+            
+            if (flock($this->lockHandle, LOCK_EX | LOCK_NB)) {
+                $lockInfo = [
+                    \'pid\' => getmypid(),
+                    \'timestamp\' => time(),
+                    \'timeout\' => $this->timeout
+                ];
+                
+                fwrite($this->lockHandle, json_encode($lockInfo));
+                fflush($this->lockHandle);
+                
+                return true;
+            } else {
+                fclose($this->lockHandle);
+                $this->lockHandle = null;
+                return false;
+            }
+            
+        } catch (Exception $e) {
+            $this->logger->error(\'Failed to acquire background lock\', [\'error\' => $e->getMessage()]);
+            return false;
+        }
+    }
+    
+    public function releaseLock() {
+        try {
+            if ($this->lockHandle) {
+                flock($this->lockHandle, LOCK_UN);
+                fclose($this->lockHandle);
+                $this->lockHandle = null;
+            }
+            
+            if (file_exists($this->lockFile)) {
+                unlink($this->lockFile);
+            }
+            
+        } catch (Exception $e) {
+            $this->logger->error(\'Failed to release background lock\', [\'error\' => $e->getMessage()]);
+        }
+    }
+    
+    public function __destruct() {
+        $this->releaseLock();
+    }
+}
+
+$lockManager = new ImprovedLockManager($lockFile, $maxRunTime);
+
+if (!$lockManager->tryLock()) {
+    $logger->info("Another background monitor is already running");
+    exit(0);
+}
 
 // 注册清理函数
-register_shutdown_function(function() use ($lockFile) {
-    if (file_exists($lockFile)) {
-        unlink($lockFile);
-    }
+register_shutdown_function(function() use ($lockManager) {
+    $lockManager->releaseLock();
 });
 
 $startTime = time();
@@ -183,16 +507,91 @@ try {
     $logger->error("Container monitor initialization failed", ["error" => $e->getMessage()]);
 }
 
-// 清理锁文件
-if (file_exists($lockFile)) {
-    unlink($lockFile);
-}
-
+$lockManager->releaseLock();
 $logger->info("Container background monitor stopped", ["total_cycles" => $cycleCount]);
 ?>';
     
     file_put_contents($scriptPath, $script);
     Logger::getInstance()->info('Container monitor script created', ['path' => $scriptPath]);
+}
+
+/**
+ * 更新监控状态文件
+ */
+function updateMonitorStatus($status, $message = '') {
+    try {
+        $statusFile = __DIR__ . '/data/monitor_status.json';
+        
+        // 确保目录存在
+        $statusDir = dirname($statusFile);
+        if (!is_dir($statusDir)) {
+            if (!mkdir($statusDir, 0750, true)) {
+                throw new Exception("Failed to create status directory: $statusDir");
+            }
+        }
+        
+        // 检查目录权限
+        if (!is_writable($statusDir)) {
+            throw new Exception("Status directory is not writable: $statusDir");
+        }
+        
+        $statusData = [
+            'last_run' => time(),
+            'last_run_formatted' => date('Y-m-d H:i:s'),
+            'status' => $status,
+            'message' => $message,
+            'updated_by' => 'api_request',
+            'php_version' => PHP_VERSION,
+            'memory_usage' => memory_get_usage(true)
+        ];
+        
+        if ($status === 'completed') {
+            $statusData['last_success'] = time();
+            $statusData['last_success_formatted'] = date('Y-m-d H:i:s');
+        } elseif ($status === 'error') {
+            $statusData['last_error'] = $message;
+            $statusData['last_error_time'] = time();
+        }
+        
+        $jsonData = json_encode($statusData, JSON_PRETTY_PRINT);
+        if ($jsonData === false) {
+            throw new Exception('Failed to encode status data to JSON');
+        }
+        
+        $result = file_put_contents($statusFile, $jsonData, LOCK_EX);
+        if ($result === false) {
+            throw new Exception("Failed to write status file: $statusFile");
+        }
+        
+        // 设置文件权限
+        chmod($statusFile, 0640);
+        
+        Logger::getInstance()->info('Monitor status updated successfully', [
+            'file' => $statusFile,
+            'status' => $status,
+            'bytes_written' => $result
+        ]);
+        
+    } catch (Exception $e) {
+        Logger::getInstance()->error('Failed to update monitor status', [
+            'error' => $e->getMessage(),
+            'status_file' => $statusFile ?? 'unknown',
+            'attempted_status' => $status
+        ]);
+        
+        // 尝试创建一个简单的状态文件
+        try {
+            $fallbackFile = __DIR__ . '/monitor_status_fallback.txt';
+            $fallbackData = date('Y-m-d H:i:s') . " - Status: $status - Message: $message\n";
+            file_put_contents($fallbackFile, $fallbackData, FILE_APPEND | LOCK_EX);
+        } catch (Exception $fe) {
+            // 最后的备选方案失败，记录到日志
+            Logger::getInstance()->critical('All status update methods failed', [
+                'original_error' => $e->getMessage(),
+                'fallback_error' => $fe->getMessage()
+            ]);
+        }
+    }
 }
 
 function redirectToSubmitPage(array $paymentResult) {
@@ -201,7 +600,7 @@ function redirectToSubmitPage(array $paymentResult) {
     <html>
     <head>
         <title>正在跳转到支付页面...</title>
-        <meta charset="utf-t">
+        <meta charset="utf-8">
         <style>
             body {
                 font-family: sans-serif;
@@ -415,4 +814,4 @@ try {
         'code' => -1,
         'msg' => $e->getMessage()
     ], JSON_UNESCAPED_UNICODE);
-} 
+}
